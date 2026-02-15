@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pika
+pymongo
+minio
+requests
+python-dotenv
+pydantic-settings
+moviepy
+imageio-ffmpeg

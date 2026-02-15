@@ -1,0 +1,14 @@
+env/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.db
+.cache/
+ffmpeg-8.0.1-essentials_build/
+bin/
+temp_*/
+output_*/
+.git
+Dockerfile
