@@ -546,6 +546,7 @@ def process_download(message_body: bytes):
                 'stage': 'user_editing', 
                 'status': 'pending', 
                 'chunk_duration_minutes': chunk_duration_minutes,
+                'chunk_duration_ms': audio_keys[0]['duration_ms'],
                 'sub': {
                     'audios': audio_keys,
                     'sample': sample_key,
