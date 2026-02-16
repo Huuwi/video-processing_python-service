@@ -18,5 +18,6 @@ COPY . .
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
-CMD ["python", "app/main.py"]
+CMD ["python", "-m", "app.main"]
