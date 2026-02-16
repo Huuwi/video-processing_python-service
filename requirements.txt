@@ -8,3 +8,4 @@ python-dotenv
 pydantic-settings
 moviepy
 imageio-ffmpeg
+ffmpeg-python
