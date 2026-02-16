@@ -199,15 +199,19 @@ def process_download(message_body: bytes):
         print(f"Video Info Fetched: Duration={duration_ms}ms, Link={display_link[:100]}...")
         
         # 1.5 Check User Balance
+        print(f"Checking database for videoId: {video_id}...")
         video_doc = video_collection.find_one({'_id': ObjectId(video_id)})
         if not video_doc:
+            print(f"Error: Video document {video_id} not found in database!")
             return
         
         user_id = video_doc.get('userId')
+        print(f"Fetching user balance for user_id: {user_id}...")
         user = user_collection.find_one({'_id': ObjectId(user_id)})
         
         if user:
             remaining_time = user.get('remaining_time_ms', 0)
+            print(f"User Balance: {remaining_time}ms, Required: {duration_ms}ms")
             if remaining_time < duration_ms:
                 print(f"User {user_id} insufficient balance. Required: {duration_ms}, Remaining: {remaining_time}")
                 video_collection.update_one(
