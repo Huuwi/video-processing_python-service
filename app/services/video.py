@@ -558,13 +558,64 @@ def process_download(message_body: bytes):
             }}
         )
 
-        # 6. Deduct Balance (After successful download)
-        if user:
-            new_remaining = max(0, user.get('remaining_time_ms', 0) - duration_ms)
-            user_collection.update_one({'_id': ObjectId(user_id)}, {'$set': {'remaining_time_ms': new_remaining}})
-            print(f"Deducted {duration_ms}ms from User {user_id}. New balance: {new_remaining}ms")
+        # 6. Double Check Balance & Deduct (Critical for Race Condition)
+        # Use Atomic find_one_and_update to ensure consistency
+        print(f"Final Atomic Balance Check & Deduct for User {user_id}...")
         
-        # 5. Check if auto_edit or batch_edit is enabled
+        try:
+            # Atomic: Check if balance >= duration AND deduct in one go
+            updated_user = user_collection.find_one_and_update(
+                {
+                    '_id': ObjectId(user_id),
+                    'remaining_time_ms': {'$gte': duration_ms}
+                },
+                {
+                    '$inc': {'remaining_time_ms': -duration_ms}
+                },
+                return_document=True # Return the NEW document (after update) to confirm
+            )
+            
+            if not updated_user:
+                # If None, it means the query failed (likely insufficient balance)
+                # Fetch current balance just for logging (non-critical)
+                current_user = user_collection.find_one({'_id': ObjectId(user_id)})
+                current_balance = current_user.get('remaining_time_ms', 0) if current_user else 0
+                
+                print(f"CRITICAL: Atomic deduction failed. Insufficient balance. User: {current_balance}, Required: {duration_ms}. Rolling back.")
+                
+                # ROLLBACK: Delete all MinIO keys
+                try:
+                    # 1. Delete Sample
+                    if sample_key:
+                        minio_client.remove_object(settings.MINIO_BUCKET, sample_key)
+                    # 2. Delete Mute
+                    if mute_key:
+                        minio_client.remove_object(settings.MINIO_BUCKET, mute_key)
+                    # 3. Delete Audio Chunks
+                    for ak in audio_keys:
+                        if ak.get('audio_key'):
+                            minio_client.remove_object(settings.MINIO_BUCKET, ak['audio_key'])
+                            
+                    print(f"Rollback cleanup complete for video {video_id}")
+                except Exception as e_cleanup:
+                     print(f"Error during rollback cleanup: {e_cleanup}")
+
+                # Update Video Status Failed
+                video_collection.update_one(
+                    {'_id': ObjectId(video_id)}, 
+                    {'$set': {'status': 'failed', 'errorMsg': f'Insufficient balance during processing. Required: {duration_ms/1000}s'}}
+                )
+                return
+            
+            # If we are here, deduction succeeded
+            new_remaining = updated_user.get('remaining_time_ms')
+            print(f"Deducted {duration_ms}ms from User {user_id}. New balance: {new_remaining}ms")
+
+        except Exception as e_db:
+             print(f"Database error during atomic deduction: {e_db}")
+             return
+
+        # 5. Check if auto_edit or batch_edit is enabled (Moved after deduction)
         # If yes, automatically publish to AI queue (skip manual user editing)
         if auto_edit or batch_edit:
             print(f"Auto-edit/Batch-edit enabled for {video_id}, auto-publishing to AI queue...")
@@ -801,7 +852,7 @@ def process_edit(message_body: bytes):
                 srt_path_fixed = safe_path_for_ffmpeg(srt_path)
                 v = v.filter('subtitles', filename=srt_path_fixed, charenc='UTF-8', force_style=style)
 
-            # C. Logo
+            # C. Logo (User Custom Logo)
             if logo_config and logo_config.get('file_key'):
                 logo_key = logo_config.get('file_key')
                 fd_logo, logo_path = tempfile.mkstemp(suffix=".png"); os.close(fd_logo); temp_files.append(logo_path)
@@ -830,7 +881,42 @@ def process_edit(message_body: bytes):
                     
                 except Exception as e:
                     print(f"Error processing logo: {e}")
-            
+
+            # D. Free User Watermark (Forced Branding)
+            # Check user total deposited
+            try:
+                user_doc = user_collection.find_one({'_id': ObjectId(user_id)})
+                total_deposited = user_doc.get('total_deposited_vnd', 0) if user_doc else 0
+                
+                if total_deposited <= 0:
+                    print(f"Free user detected (Deposit: {total_deposited}). Adding forced watermark.")
+                    watermark_path = "/app/logo.png" # Path in Docker
+                    
+                    if os.path.exists(watermark_path):
+                        # Add watermark
+                        wm_in = ffmpeg_lib.input(watermark_path)
+                        # Scale to 30% width, keep aspect ratio
+                        # w=video_width*0.3
+                        # We use 'ivw' (input video width) if possible, or use fixed vid_w
+                        
+                        # Note: We need to ensure we use the 'v' stream dims. 
+                        # ffmpeg-python filter string can take expressions?
+                        # scale=w=iw*0.3:h=-1
+                        # But wait, 'iw' refers to the input of the filter (the logo itself).
+                        # We want 30% of main video.
+                        # We know vid_w is the main video width.
+                        
+                        wm_target_w = int(vid_w * 0.3)
+                        wm_scaled = wm_in.filter('scale', w=wm_target_w, h=-1)
+                        
+                        # Overlay at center: x=(W-w)/2:y=(H-h)/2
+                        v = v.overlay(wm_scaled, x="(W-w)/2", y="(H-h)/2")
+                    else:
+                        print(f"WARNING: Watermark file not found at {watermark_path}")
+
+            except Exception as e_wm:
+                print(f"Error processing free watermark: {e_wm}")
+
             # 5. Build & Run Command
             fd_final, final_path = tempfile.mkstemp(suffix=".mp4"); os.close(fd_final); temp_files.append(final_path)
             
@@ -863,7 +949,37 @@ def process_edit(message_body: bytes):
             final_s3_key = f"result/{user_id}/{video_id}.mp4"
             with open(final_path, 'rb') as f_final:
                 minio_client.put_object(settings.MINIO_BUCKET, final_s3_key, f_final, os.stat(final_path).st_size, "video/mp4")
+            
             video_collection.update_one({'_id': ObjectId(video_id)}, {'$set': {'status': 'completed', 'stage': 'completed', 'download_link': final_s3_key}})
+            
+            # 7. Cleanup Raw Files from MinIO (To save SSD)
+            print(f"Cleaning up raw files for {video_id}...")
+            try:
+                # Keys to delete
+                keys_to_delete = []
+                if video_mute_key: keys_to_delete.append(video_mute_key) # origin_mute
+                if audio_key: keys_to_delete.append(audio_key)           # final_audio
+                
+                # Sample
+                sample_key = sub_data.get('sample')
+                if sample_key: keys_to_delete.append(sample_key)
+                
+                # Audio Chunks
+                audios = sub_data.get('audios', [])
+                for a in audios:
+                    if a.get('audio_key'):
+                         keys_to_delete.append(a.get('audio_key'))
+                
+                for k in keys_to_delete:
+                    try:
+                        minio_client.remove_object(settings.MINIO_BUCKET, k)
+                    except Exception as e_del:
+                        print(f"Failed to delete {k}: {e_del}")
+                        
+                print(f"Cleanup finished. Deleted {len(keys_to_delete)} objects.")
+                
+            except Exception as e_cleanup:
+                print(f"Error during post-processing cleanup: {e_cleanup}")
 
 
         finally:
