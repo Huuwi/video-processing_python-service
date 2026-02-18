@@ -652,6 +652,142 @@ def process_download(message_body: bytes):
 
 
 
+                pass
+
+def apply_subtitles(v_stream, vid_w, vid_h, sub_config, srt_path, resize_mode):
+    """
+    Applies subtitle background (blur/box) and subtitle text to the video stream.
+    Returns the modified video stream.
+    """
+    show_sub = sub_config.get('show', True)
+    
+    # Helper definitions inside or outside? Outside is cleaner but need context.
+    # Let's keep helpers inside for now or assume they are available.
+    def hex_to_ffmpeg_color(hex_color, opacity=1.0):
+        if not hex_color or hex_color == 'transparent': return None
+        return f"{hex_color}@{opacity}"
+
+    def hex_to_ass_color(hex_str):
+        if not hex_str or hex_str == 'transparent':
+            return None
+        hex_str = hex_str.lstrip('#')
+        r, g, b = hex_str[0:2], hex_str[2:4], hex_str[4:6]
+        return f"&H00{b}{g}{r}&"
+
+    def map_font_to_linux(font_name):
+        font_map = {
+            'Arial': 'Arial', 
+            'Times New Roman': 'Liberation Serif', # Better mapping
+            'Courier New': 'Liberation Mono', 
+            'Verdana': 'DejaVu Sans',
+            'Tahoma': 'DejaVu Sans Condensed',
+            'Comic Sans MS': 'Comic Sans MS',
+            'Impact': 'Impact',
+            'Georgia': 'Liberation Serif',
+            'Trebuchet MS': 'Trebuchet MS'
+        }
+        return font_map.get(font_name, font_name)
+
+    if not show_sub:
+        print("DEBUG: Subtitles disabled (show_sub=False)")
+        return v_stream
+
+    # Common scaling (replicated from main logic)
+    print(f"DEBUG: Applying subtitles... Mode={resize_mode}")
+    
+    canvas_w = 360 if resize_mode == '9:16' else 640
+    canvas_h = 640 if resize_mode == '9:16' else 360
+    scale_x = vid_w / canvas_w
+    scale_y = vid_h / canvas_h
+    
+    sub_x = float(sub_config.get('x', 0))
+    sub_y = float(sub_config.get('y', vid_h * 0.8))
+    sub_w = float(sub_config.get('width', 300))
+    sub_h = float(sub_config.get('height', 50))
+    raw_font_size = float(sub_config.get('font_size', 24))
+    font_name = sub_config.get('font', 'Arial')
+    font_name = map_font_to_linux(font_name)
+    bg_opacity = float(sub_config.get('bg_opacity', 1.0))
+    
+    custom_scale = 0.8
+    custom_pad_v = 0
+    if resize_mode == "16:9":
+        custom_scale = 0.8
+        custom_pad_v = -2
+
+    # Scale to Actual Video
+    real_x = int(sub_x * scale_x)
+    real_y = int(sub_y * scale_y)
+    real_w = int(sub_w * scale_x)
+    real_h = int(sub_h * scale_y * custom_scale)
+    
+    # Font Size Calculation
+    def calculate_font_size(raw, mode):
+        v = raw // 3.5 if mode == '9:16' else raw // 2
+        return v
+        
+    real_font_size = calculate_font_size(raw_font_size, resize_mode)
+    
+    text_color_hex = sub_config.get('color', '#FFFFFF')
+    bg_color_hex = sub_config.get('bg_color', '#000000')
+    text_color_ass = hex_to_ass_color(text_color_hex) or "&H00FFFFFF&"
+
+    # 1. Background Blur/Box
+    if bg_color_hex and bg_color_hex != 'transparent':
+        # Glass Blur
+        if bg_opacity < 1.0:
+            try:
+                safe_x = max(0, min(vid_w - 1, real_x))
+                safe_y = max(0, min(vid_h - 1, real_y))
+                safe_w = min(real_w, vid_w - safe_x)
+                safe_h = min(real_h, vid_h - safe_y)
+
+                if safe_w > 0 and safe_h > 0:
+                    v_split = v_stream.split()
+                    v_orig = v_split[0]
+                    v_blur = v_split[1]
+                    
+                    blurred_patch = (
+                        v_blur
+                        .crop(x=safe_x, y=safe_y, width=safe_w, height=safe_h)
+                        .filter('boxblur', 10)
+                    )
+                    v_stream = v_orig.overlay(blurred_patch, x=safe_x, y=safe_y)
+            except Exception as e:
+                print(f"DEBUG: Blur failed: {e}")
+
+        # Draw Box
+        box_color = hex_to_ffmpeg_color(bg_color_hex, bg_opacity)
+        if box_color:
+             v_stream = v_stream.drawbox(
+                x=real_x, y=real_y, 
+                width=real_w, height=real_h, 
+                color=box_color, t="fill"
+            )
+
+    # 2. Subtitles
+    def convert_px_to_v(px, height):
+        return px / (height / 275)
+
+    style = (
+        f"FontName={font_name},"
+        f"Fontsize={real_font_size},"
+        f"PrimaryColour={text_color_ass},"
+        "BorderStyle=1,"
+        "Outline=0.1,"
+        "Shadow=0,"
+        f"MarginL=0,"
+        f"MarginV={convert_px_to_v(vid_h - real_y - real_h * 0.6 , vid_h)}"
+    )
+    
+    print(f"DEBUG: Subtitle Style: {style}")
+    
+    # Fix path for Windows/Linux consistency
+    srt_path_fixed = str(Path(srt_path).resolve()).replace("\\", "/")
+    
+    v_stream = v_stream.filter('subtitles', filename=srt_path_fixed, charenc='UTF-8', force_style=style)
+    return v_stream
+
 def process_edit(message_body: bytes):
     try:
         data = json.loads(message_body)
@@ -683,18 +819,7 @@ def process_edit(message_body: bytes):
         
         temp_files = []
         
-        def safe_path_for_ffmpeg(p: str) -> str:
-            # Strictly use forward slashes, no other escaping (as per test.py)
-            return str(Path(p).resolve()).replace("\\", "/")
 
-        def hex_to_ass_style(hex_color):
-            if not hex_color: return "&H00FFFFFF&"
-            hex_color = hex_color.lstrip('#')
-            if len(hex_color) == 6:
-                r, g, b = hex_color[0:2], hex_color[2:4], hex_color[4:6]
-                # Return 8-digit hex (00 for opaque alpha)
-                return f"&H00{b}{g}{r}&" 
-            return "&H00FFFFFF&"
 
         try:
             # 2. Download tài nguyên
@@ -708,6 +833,12 @@ def process_edit(message_body: bytes):
             with minio_client.get_object(settings.MINIO_BUCKET, audio_key) as obj:
                 with open(audio_path, 'wb') as f:
                     for chunk in obj.stream(32*1024): f.write(chunk)
+            
+            # DEBUG: Check Audio File
+            a_size = os.path.getsize(audio_path)
+            print(f"DEBUG: Audio Path: {audio_path}, Size: {a_size} bytes, Key: {audio_key}")
+            if a_size < 100:
+                print("WARNING: Audio file is suspiciously small!")
                  
             fd_srt, srt_path = tempfile.mkstemp(suffix=".srt"); os.close(fd_srt); temp_files.append(srt_path)
             with open(srt_path, 'w', encoding='utf-8') as f:
@@ -778,79 +909,17 @@ def process_edit(message_body: bytes):
             print(f"DEBUG - Canvas: {canvas_w}x{canvas_h}, Video: {vid_w}x{vid_h}")
             print(f"DEBUG - Scale Factors: x={scale_x:.2f}, y={scale_y:.2f}")
 
-            def convert_px_to_v(px,height=vid_h):
-                rate_V_px = height / 275
-                return px / rate_V_px
-
-            def calculate_font_size(raw_size,resize_mode):
-                size_v = raw_size
-                if resize_mode == '9:16':
-                    size_v = size_v // 3.5
-                else:
-                    size_v = size_v // 2
-                return size_v
+            print(f"DEBUG - Scale Factors: x={scale_x:.2f}, y={scale_y:.2f}")
             # B. Subtitles
-            if srt_content and srt_content.strip():
-                # Define helper for color
-                def hex_to_ass_color(hex_str):
-                    if not hex_str or hex_str == 'transparent':
-                        return None
-                    hex_str = hex_str.lstrip('#')
-                    r, g, b = hex_str[0:2], hex_str[2:4], hex_str[4:6]
-                    return f"&H00{b}{g}{r}&"
-
-                # Get Config (Pixel Values from Frontend)
-                sub_x = float(sub_config.get('x', 0))
-                sub_y = float(sub_config.get('y', vid_h * 0.8)) # Fallback if missing
-                sub_w = float(sub_config.get('width', 300))
-                sub_h = float(sub_config.get('height', 50))
-                raw_font_size = float(sub_config.get('font_size', 24))
-                
-                custom_scale = 0.8
-                custom_pad_v = 0
-                if resize_mode == "16:9":
-                    custom_scale = 0.8
-                    custom_pad_v = -2
-
-                # Scale to Actual Video
-                real_x = int(sub_x * scale_x )
-                real_y = int(sub_y * scale_y  )
-                real_w = int(sub_w * scale_x )
-                real_h = int(sub_h * scale_y * custom_scale)                
-                real_font_size = calculate_font_size(raw_font_size, resize_mode)
-                
-                # Colors
-                text_color_hex = sub_config.get('color', '#FFFFFF')
-                bg_color_hex = sub_config.get('bg_color', '#000000')
-                text_color_ass = hex_to_ass_color(text_color_hex) or "&H00FFFFFF&"
-                
-                # 1. DRAW BACKGROUND BOX (First Layer)
-                if bg_color_hex and bg_color_hex != 'transparent':
-                    v = v.drawbox(
-                        x=real_x, y=real_y, 
-                        width=real_w, height=real_h, 
-                        color=bg_color_hex, t="fill"
-                    )
-
-                # 2. SUBTITLES (Second Layer - On Top)
-
-                style = (
-                        "FontName=Arial,"
-                        f"Fontsize={real_font_size},"
-                        f"PrimaryColour={text_color_ass},"
-                        "BorderStyle=1,"
-                        "Outline=0.1,"
-                        "Shadow=0,"
-                        f"MarginL=0,"
-                        f"MarginV={convert_px_to_v(vid_h - real_y - real_h * 0.6 + custom_pad_v)}"
-                    )
-
-                # 1280 px = 275V +- 3V
-                
-                print(f"DEBUG - Subtitle Box: x={real_x}, y={real_y}, w={real_w}, h={real_h}")
-                
-                srt_path_fixed = safe_path_for_ffmpeg(srt_path)
-                v = v.filter('subtitles', filename=srt_path_fixed, charenc='UTF-8', force_style=style)
+            # DEBUG: Why are subtitles skipped?
+            show_sub = sub_config.get('show', True)
+            srt_exists = bool(srt_content and srt_content.strip())
+            print(f"DEBUG: show_sub={show_sub}, srt_exists={srt_exists}")
+            
+            if srt_exists:
+                 v = apply_subtitles(v, vid_w, vid_h, sub_config, srt_path, resize_mode)
+            else:
+                 print("DEBUG: Skipping subtitles because SRT content is empty.")
 
             # C. Logo (User Custom Logo)
             if logo_config and logo_config.get('file_key'):
@@ -924,21 +993,28 @@ def process_edit(message_body: bytes):
             
             # Global args (inputs are already defined in fluent chain)
             # Output arguments
+            # Output arguments
             out_args = {
                 'vcodec': 'libx264',
-                'preset': 'ultrafast',
-                'crf': '23',
                 'pix_fmt': 'yuv420p',
-                'acodec': 'aac',
+                'preset': 'ultrafast',
+                'crf': 23,
+                'acodec': 'aac', 
                 'audio_bitrate': '192k',
+                'strict': 'experimental',
                 'shortest': None
             }
             
             # Compile and run
             # Important: pass cmd=ffmpeg_exe to use the binary we found
+            stream_spec = ffmpeg_lib.output(v, a, final_path, **out_args)
+            try:
+                print(f"DEBUG: FFmpeg Command: {stream_spec.compile(cmd=ffmpeg_exe)}")
+            except Exception as e_compile:
+                print(f"DEBUG: Could not compile command: {e_compile}")
+
             (
-                ffmpeg_lib
-                .output(v, a, final_path, **out_args)
+                stream_spec
                 .overwrite_output()
                 .run(cmd=ffmpeg_exe, quiet=False)
             )
