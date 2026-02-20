@@ -1011,7 +1011,7 @@ def process_edit(message_body: bytes):
                     # Mix background music at very low volume under TTS audio
                     # 0.07 ≈ -23dB — quiet background music that doesn't overpower narration
                     bgm_loop_in = ffmpeg_lib.input(bgm_loop_path)
-                    bgm_audio = bgm_loop_in.audio.filter('volume', '1')
+                    bgm_audio = bgm_loop_in.audio.filter('volume', '0.3')
                     # amix: merge two audio streams, keep the longest (i.e. full TTS duration)
                     a = ffmpeg_lib.filter([a, bgm_audio], 'amix', inputs=2, duration='longest')
                     print("DEBUG: Background music mixed into audio stream")
