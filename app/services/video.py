@@ -1056,6 +1056,12 @@ def process_edit(message_body: bytes):
                         
                 print(f"Cleanup finished. Deleted {len(keys_to_delete)} objects.")
                 
+                # Mark raw files as cleaned so NestJS cron skips the fallback
+                video_collection.update_one(
+                    {'_id': ObjectId(video_id)},
+                    {'$set': {'raw_cleaned': True}}
+                )
+                
             except Exception as e_cleanup:
                 print(f"Error during post-processing cleanup: {e_cleanup}")
 
