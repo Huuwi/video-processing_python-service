@@ -44,7 +44,7 @@ def fetch_video_info(url: str):
                  raise Exception("Force Bilibili Fallback for best quality")
 
             # B. DOUYIN/TIKTOK HANDLER (Simpler success path from user snippet)
-            # User's snippet: download_link = response['data']['video']['bit_rate'][0]['play_addr']['url_list'][0]
+        # User's snippet: download_link = response['data']['video']['bit_rate'][0]['play_addr']['url_list'][0]
             # Verify structure exists
             
             # Hybrid response structure usually:
@@ -951,6 +951,74 @@ def process_edit(message_body: bytes):
                     
                 except Exception as e:
                     print(f"Error processing logo: {e}")
+
+            # C2. Background Music
+            bg_music_config = meta.get('bg_music', {})
+            if bg_music_config and bg_music_config.get('file_key'):
+                bg_music_key = bg_music_config['file_key']
+                fd_bgm, bgm_path = tempfile.mkstemp(suffix=".mp3")
+                os.close(fd_bgm)
+                temp_files.append(bgm_path)
+                try:
+                    with minio_client.get_object(settings.MINIO_BUCKET, bg_music_key) as obj:
+                        with open(bgm_path, 'wb') as f:
+                            for chunk in obj.stream(32*1024): f.write(chunk)
+
+                    print(f"DEBUG: Downloaded bg music: {bg_music_key}")
+
+                    # Get video duration via ffprobe
+                    dur_result = subprocess.run(
+                        [ffprobe_exe, '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+                        capture_output=True, text=True
+                    )
+                    video_duration = float(dur_result.stdout.strip())
+
+                    # Get music duration via ffprobe
+                    music_result = subprocess.run(
+                        [ffprobe_exe, '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'default=noprint_wrappers=1:nokey=1', bgm_path],
+                        capture_output=True, text=True
+                    )
+                    music_duration = float(music_result.stdout.strip())
+
+                    print(f"DEBUG: video_duration={video_duration:.2f}s, music_duration={music_duration:.2f}s")
+
+                    # Build looped/trimmed background music temp file
+                    fd_bgm_loop, bgm_loop_path = tempfile.mkstemp(suffix=".mp3")
+                    os.close(fd_bgm_loop)
+                    temp_files.append(bgm_loop_path)
+
+                    if video_duration <= music_duration:
+                        # Video shorter than music: trim music to video length
+                        subprocess.run([
+                            ffmpeg_exe, '-y', '-i', bgm_path,
+                            '-t', str(video_duration),
+                            '-c', 'copy', bgm_loop_path
+                        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        print(f"DEBUG: Trimmed bg music to {video_duration:.2f}s")
+                    else:
+                        # Video longer than music: loop music using -stream_loop
+                        loop_count = math.ceil(video_duration / music_duration) + 1
+                        subprocess.run([
+                            ffmpeg_exe, '-y',
+                            '-stream_loop', str(loop_count),
+                            '-i', bgm_path,
+                            '-t', str(video_duration),
+                            '-c', 'copy', bgm_loop_path
+                        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        print(f"DEBUG: Looped bg music {loop_count}x to cover {video_duration:.2f}s")
+
+                    # Mix background music at very low volume under TTS audio
+                    # 0.07 ≈ -23dB — quiet background music that doesn't overpower narration
+                    bgm_loop_in = ffmpeg_lib.input(bgm_loop_path)
+                    bgm_audio = bgm_loop_in.audio.filter('volume', '0.07')
+                    # amix: merge two audio streams, keep the longest (i.e. full TTS duration)
+                    a = ffmpeg_lib.filter([a, bgm_audio], 'amix', inputs=2, duration='longest')
+                    print("DEBUG: Background music mixed into audio stream")
+
+                except Exception as e:
+                    print(f"Error processing background music: {e}")
 
             # D. Free User Watermark (Forced Branding)
             # Check user total deposited
