@@ -879,9 +879,10 @@ def process_edit(message_body: bytes):
             in_v = ffmpeg_lib.input(video_path)
             v = in_v.video
             
-            # Input 1: Audio
+            # Input 1: Audio — pad with silence so it's never shorter than the video
+            # This prevents video being cut when TTS audio ends before video ends.
             in_a = ffmpeg_lib.input(audio_path)
-            a = in_a.audio
+            a = in_a.audio.filter('apad')  # pad silence to match video length
 
             pad_v = 0
             
@@ -999,10 +1000,11 @@ def process_edit(message_body: bytes):
                 'pix_fmt': 'yuv420p',
                 'preset': 'ultrafast',
                 'crf': 23,
-                'acodec': 'aac', 
+                'acodec': 'aac',
                 'audio_bitrate': '192k',
                 'strict': 'experimental',
-                'shortest': None
+                # No 'shortest' — video always runs full length.
+                # Audio is padded via apad filter instead.
             }
             
             # Compile and run
